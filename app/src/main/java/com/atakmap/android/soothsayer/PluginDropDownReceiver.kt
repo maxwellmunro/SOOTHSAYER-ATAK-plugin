@@ -2,11 +2,17 @@ package com.atakmap.android.soothsayer
 
 import android.annotation.SuppressLint
 import android.app.AlertDialog
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.BitmapDrawable
+import android.net.Uri
+import android.os.Build
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -31,6 +37,7 @@ import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.RequiresApi
 import androidx.core.widget.addTextChangedListener
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -99,7 +106,6 @@ import com.atakmap.android.soothsayer.util.showAlert
 import com.atakmap.android.soothsayer.util.toast
 import com.atakmap.android.util.SimpleItemSelectedListener
 import com.atakmap.coremap.maps.assets.Icon
-import com.atakmap.coremap.maps.conversion.EGM96
 import com.atakmap.coremap.maps.coords.GeoPoint
 import com.atakmap.map.elevation.ElevationData
 import com.atakmap.map.elevation.ElevationManager
@@ -118,8 +124,14 @@ import java.util.UUID
 import kotlin.math.ceil
 import kotlin.math.min
 import kotlin.math.sqrt
+import java.io.IOException
+import java.io.InputStreamReader
+import java.util.zip.ZipInputStream
+import androidx.core.graphics.scale
+import androidx.core.graphics.createBitmap
 
 
+@RequiresApi(Build.VERSION_CODES.O)
 class PluginDropDownReceiver(
     mapView: MapView?,
     val pluginContext: Context, private val mapOverlay: PluginMapOverlay
@@ -138,6 +150,9 @@ class PluginDropDownReceiver(
     private val settingsLayersView = templateView.findViewById<LinearLayout>(R.id.settingsLayersLayout)
     private val settingsOptionsView = templateView.findViewById<LinearLayout>(R.id.settingsOptionsLayout)
     private val colourPickerView = templateView.findViewById<LinearLayout>(R.id.colourPickerLayout)
+    private val templatesMenuView = templateView.findViewById<LinearLayout>(R.id.templatesMenuLayout)
+    private val pickIconMenuView = templateView.findViewById<LinearLayout>(R.id.pickIconLayout)
+    private val newTemplateMenuView = templateView.findViewById<LinearLayout>(R.id.newTemplateMenuLayout)
     private val svMode: Switch = settingsLayersView.findViewById(R.id.svMode)
     private val cbCoverageLayer: CheckBox = settingsLayersView.findViewById(R.id.cbKmzLayer)
     private val cbLinkLines: CheckBox = settingsLayersView.findViewById(R.id.cbLinkLines)
@@ -170,6 +185,8 @@ class PluginDropDownReceiver(
     private var trackingRunnable: Runnable? = null
     private val lastKnownLocations = HashMap<String, GeoPoint>()
     private var colourPickerCurId: Int = 0
+    private var pickingFileForTemplate: Boolean = true
+    private var preImportTemplates: ArrayList<TemplateDataModel> = ArrayList()
 
     class ColourRef(var value: Int)
 
@@ -200,8 +217,180 @@ class PluginDropDownReceiver(
         return (colour and 0xFFFFFF00.toInt()) or (blue and 0xFF)
     }
 
+    private fun parseJsonBytes(bytes: ByteArray): TemplateDataModel? {
+        val gson = Gson()
+        try {
+            return ByteArrayInputStream(bytes).use { inputStream ->
+                InputStreamReader(inputStream).use { reader ->
+                    gson.fromJson(reader, TemplateDataModel::class.java)
+                }
+            }
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private fun parseZipBytes(bytes: ByteArray): ArrayList<TemplateDataModel> {
+        val gson = Gson()
+        val results: ArrayList<TemplateDataModel> = ArrayList()
+
+        ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                if (!entry.isDirectory && entry.name.endsWith(".json")) {
+                    try {
+                        val reader = InputStreamReader(zip)
+                        val obj = gson.fromJson(reader, TemplateDataModel::class.java)
+                        results.add(obj)
+                    } catch (_: Exception) {}
+                }
+                entry = zip.nextEntry
+            }
+        }
+
+        return results
+    }
+
+    private fun byteArrayToTemplateArray(bytes: ByteArray): ArrayList<TemplateDataModel> {
+        if (bytes.size < 4)
+            return ArrayList()
+
+        val isZip = bytes[0] == 0x50.toByte()
+                && bytes[1] == 0x4B.toByte()
+                && bytes[2] == 0x03.toByte()
+                && bytes[3] == 0x04.toByte()
+
+        return if (isZip) parseZipBytes(bytes) else parseJsonBytes(bytes)?.let {arrayListOf(it)} ?: arrayListOf()
+    }
+
+    private fun isTemplateValid(template: TemplateDataModel): Boolean {
+        val transmitter = template.transmitter ?: return false
+        val antenna = template.antenna
+
+        return     transmitter.lat in -89.0..89.0
+                && transmitter.lon in -180.0..180.0
+                && transmitter.alt in .1..120_000.0
+                && transmitter.frq in 2.0..100_000.0
+                && transmitter.txw in .001..2_000_000.0
+                && transmitter.bwi in .001..200.0
+
+                && antenna.txg in -10.0..60.0
+                && antenna.txl in .0..60.0
+                && antenna.azi.split(",").all { it.toInt() in 0..360 }
+                && antenna.tlt in -90..90
+                && antenna.hbw in 0..360
+                && antenna.vbw in 0..360
+                && antenna.fbr in .0..60.0
+                && antenna.pol in arrayOf("v", "h")
+
+    }
+
+    private fun getValidTemplateArrays(bytes: ByteArray): Pair<ArrayList<TemplateDataModel>, Boolean> {
+        val allTemplates = byteArrayToTemplateArray(bytes)
+        var someInvalid = false
+
+        val gson = Gson()
+
+        allTemplates.removeIf { item ->
+            Log.d(TAG, "Received template:\n" + gson.toJson(item))
+            val invalid = !isTemplateValid(item)
+            if (invalid) someInvalid = true
+            invalid
+        }
+
+        return Pair(allTemplates, someInvalid)
+    }
+
+    private fun byteArrayToBitmap(bytes: ByteArray) : Bitmap? {
+        return try {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size).scale(50, 50)
+        } catch (_: RuntimeException) {
+            null
+        }
+    }
+
+    private val filePickedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == "com.soothsayer.FILE_SELECTED") {
+                val uri: Uri? = intent.getParcelableExtra("uri")
+
+                Log.d(TAG, "Received URI: ${uri.toString()}")
+
+                if (uri != null) {
+                    try {
+                        context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                            val bytes = inputStream.readBytes()
+
+                            val fileName = intent.getStringExtra("file_name") ?: return
+
+                            if (pickingFileForTemplate) {
+                                newTemplateMenuView.findViewById<TextView>(R.id.tvNewTemplateFileName).text = fileName
+
+                                val res = getValidTemplateArrays(bytes)
+
+                                preImportTemplates = res.first
+                                if (res.second)
+                                    Toast.makeText(pluginContext, "Some templates were invalid, skipping...", Toast.LENGTH_SHORT).show()
+                            } else {
+                                newTemplateMenuView.findViewById<TextView>(R.id.tvNewTemplateIconName).text = fileName
+
+                                val preImportTemplateIcon = byteArrayToBitmap(bytes)
+                                newTemplateMenuView.findViewById<ImageView>(R.id.ivNewTemplateIcon).setImageBitmap(preImportTemplateIcon)
+                            }
+                        }
+                    } catch (e: SecurityException) {
+                        Log.e(TAG, "No permission to read URI", e)
+                    } catch (e: IOException) {
+                        Log.e(TAG, "Failed to read URI", e)
+                    }
+                }
+            }
+        }
+    }
+
+    fun getBitmapFromImageView(imageView: ImageView): Bitmap? {
+        val drawable = imageView.drawable ?: return null
+
+        return if (drawable is BitmapDrawable) {
+            drawable.bitmap
+        } else {
+            val bitmap = createBitmap(drawable.intrinsicWidth.takeIf { it > 0 } ?: 1,
+                drawable.intrinsicHeight.takeIf { it > 0 } ?: 1)
+
+            val canvas = Canvas(bitmap)
+            drawable.setBounds(0, 0, canvas.width, canvas.height)
+            drawable.draw(canvas)
+            bitmap
+        }
+    }
+
+    fun bitmapFromDrawable(drawableRes: Int): Bitmap? {
+        val drawable = pluginContext.getDrawable(drawableRes) ?: return null
+
+        val bitmap = createBitmap(drawable.intrinsicWidth.takeIf { it > 0 } ?: 1,
+            drawable.intrinsicHeight.takeIf { it > 0 } ?: 1)
+
+        val canvas = Canvas(bitmap)
+        drawable.setBounds(0, 0, canvas.width, canvas.height)
+        drawable.draw(canvas)
+
+        return bitmap
+    }
+
+
+    private var filePickerReceiverRegistered = false
+
     // Initialise views, listeners and handle map clicks
     init {
+        if (!filePickerReceiverRegistered) {
+            pluginContext.registerReceiver(
+                filePickedReceiver,
+                IntentFilter("com.soothsayer.FILE_SELECTED"),
+                Context.RECEIVER_EXPORTED
+            )
+            filePickerReceiverRegistered = true
+        }
+
         initViews()
         initListeners()
         initSpotBeam()
@@ -577,6 +766,126 @@ class PluginDropDownReceiver(
                 settingsOptionsDB4.addTextChangedListener(this)            }
         })
 
+        val btnOpenTemplateMenu = settingView.findViewById<Button>(R.id.btnTemplateMenu)
+        btnOpenTemplateMenu.setOnClickListener {
+            settingView.visibility = View.GONE
+            templatesMenuView.visibility = View.VISIBLE
+        }
+
+        val templateBackBtn = templatesMenuView.findViewById<ImageView>(R.id.templateMenuBack)
+        templateBackBtn.setOnClickListener {
+            settingView.visibility = View.VISIBLE
+            templatesMenuView.visibility = View.GONE
+        }
+
+        val templateRecyclerView = templatesMenuView.findViewById<RecyclerView>(R.id.templatesRecyclerView)
+        val templateAdapter = TemplateRecyclerViewAdapter(mutableListOf())
+        templateRecyclerView.adapter = templateAdapter
+        templateRecyclerView.layoutManager = LinearLayoutManager(templateRecyclerView.context)
+
+        val newTemplateBtn = templatesMenuView.findViewById<ImageButton>(R.id.btnNewTemplate)
+        newTemplateBtn.setOnClickListener {
+            templatesMenuView.visibility = View.GONE
+            newTemplateMenuView.visibility = View.VISIBLE
+        }
+
+        val newTemplatePickFileBtn = newTemplateMenuView.findViewById<Button>(R.id.btnNewTemplatePickFile)
+        newTemplatePickFileBtn.setOnClickListener {
+            pickingFileForTemplate = true
+            val intent = Intent(pluginContext, FilePickerActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            pluginContext.startActivity(intent)
+
+        }
+
+        val newTemplatePickIconBtn = newTemplateMenuView.findViewById<Button>(R.id.btnNewTemplatePickIcon)
+        newTemplatePickIconBtn.setOnClickListener {
+            newTemplateMenuView.visibility = View.GONE
+            pickIconMenuView.visibility = View.VISIBLE
+        }
+
+        val newTemplateMenuCancelBtn = newTemplateMenuView.findViewById<Button>(R.id.btnCancelNewTemplate)
+        newTemplateMenuCancelBtn.setOnClickListener {
+            newTemplateMenuView.findViewById<TextView>(R.id.tvNewTemplateFileName).text = ""
+            newTemplateMenuView.findViewById<TextView>(R.id.tvNewTemplateIconName).text = ""
+            newTemplateMenuView.findViewById<ImageView>(R.id.ivNewTemplateIcon).setImageBitmap(null);
+
+            preImportTemplates.clear()
+
+            newTemplateMenuView.visibility = View.GONE
+            templatesMenuView.visibility = View.VISIBLE
+        }
+
+        val newTemplateMenuImportButton = newTemplateMenuView.findViewById<Button>(R.id.btnConfirmNewTemplate)
+        newTemplateMenuImportButton.setOnClickListener {
+            preImportTemplates.forEach {
+                val icon = getBitmapFromImageView(newTemplateMenuView.findViewById(R.id.ivNewTemplateIcon))
+                templateAdapter.addTemplate(it, icon)
+            }
+
+            newTemplateMenuView.findViewById<TextView>(R.id.tvNewTemplateFileName).text = ""
+            newTemplateMenuView.findViewById<TextView>(R.id.tvNewTemplateIconName).text = ""
+            newTemplateMenuView.findViewById<ImageView>(R.id.ivNewTemplateIcon).setImageBitmap(null);
+
+            preImportTemplates.clear()
+
+            newTemplateMenuView.visibility = View.GONE
+            templatesMenuView.visibility = View.VISIBLE
+        }
+
+        val cbSelectAllTemplates = templatesMenuView.findViewById<CheckBox>(R.id.cbTemplatesAll)
+        cbSelectAllTemplates.setOnCheckedChangeListener { _, isChecked ->
+            templateAdapter.selectAll(isChecked)
+        }
+
+        val btnDeleteTemplates = templatesMenuView.findViewById<ImageButton>(R.id.btnDeleteTemplates)
+        btnDeleteTemplates.setOnClickListener {
+            templateAdapter.deleteSelected()
+            templateAdapter.selectAll(false)
+            cbSelectAllTemplates.isChecked = false
+        }
+
+        val newTemplateBackBtn = newTemplateMenuView.findViewById<ImageView>(R.id.newTemplateBackBtn)
+        newTemplateBackBtn.setOnClickListener {
+            newTemplateMenuView.findViewById<TextView>(R.id.tvNewTemplateFileName).text = ""
+            newTemplateMenuView.findViewById<TextView>(R.id.tvNewTemplateIconName).text = ""
+            newTemplateMenuView.findViewById<ImageView>(R.id.ivNewTemplateIcon).setImageBitmap(null);
+
+            preImportTemplates.clear()
+
+            newTemplateMenuView.visibility = View.GONE
+            templatesMenuView.visibility = View.VISIBLE
+        }
+
+        val templateIconRecyclerView = pickIconMenuView.findViewById<RecyclerView>(R.id.rvNewTemplateIcons)
+        val templateIconAdapter = TemplateIconsRecyclerViewAdapter(mutableListOf(bitmapFromDrawable(R.drawable.link_icon)),
+            newTemplateMenuView.findViewById(R.id.ivNewTemplateIcon), pickIconMenuView, newTemplateMenuView)
+        templateIconRecyclerView.adapter = templateIconAdapter
+        templateIconRecyclerView.layoutManager = LinearLayoutManager(templateIconRecyclerView.context)
+
+        templateIconRecyclerView.setOnClickListener {
+            newTemplateMenuView.visibility = View.VISIBLE
+            pickIconMenuView.visibility = View.GONE
+        }
+
+        val newTemplatePickIconFileBtn = pickIconMenuView.findViewById<Button>(R.id.btnNewTemplatePickIconFile)
+        newTemplatePickIconFileBtn.setOnClickListener {
+            pickingFileForTemplate = false
+            val intent = Intent(pluginContext, FilePickerActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            pluginContext.startActivity(intent)
+
+            newTemplateMenuView.visibility = View.VISIBLE
+            pickIconMenuView.visibility = View.GONE
+        }
+
+        val pickIconBackBtn = pickIconMenuView.findViewById<ImageView>(R.id.pickIconBackBtn)
+        pickIconBackBtn.setOnClickListener {
+            pickIconMenuView.visibility = View.GONE
+            newTemplateMenuView.visibility = View.VISIBLE
+        }
     }
 
     // List of radio templates. They can be selected to edit settings etc
@@ -646,7 +955,7 @@ class PluginDropDownReceiver(
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     val extraTemplates = getTemplatesFromFolder()
-                    if (extraTemplates.isEmpty()) { 
+                    if (extraTemplates.isEmpty()) {
                         pluginContext.createAndStoreFiles(getAllFilesFromAssets())
                         templateItems.clear()
                         templateItems.addAll(getTemplatesFromFolder())
@@ -1413,7 +1722,7 @@ class PluginDropDownReceiver(
     fun addSingleLayer(layerName: String, filePath: String, bounds: List<Double>) {
         val file = File(filePath)
         synchronized(this@PluginDropDownReceiver) {
-            if (singleSiteCloudRFLayer != null) { 
+            if (singleSiteCloudRFLayer != null) {
                 singleSiteCloudRFLayer = null
                 GLLayerFactory.unregister(GLCloudRFLayer.SPI)
             }
@@ -1460,9 +1769,9 @@ class PluginDropDownReceiver(
                 singleSiteCloudRFLayer
             )
             singleSiteCloudRFLayer?.isVisible = true
-            
+
             handleLayerVisibility()
-            
+
             refreshView()
         }
     }
@@ -1470,7 +1779,7 @@ class PluginDropDownReceiver(
     private fun addLayer(filePath: String, bounds: List<Double>) {
         val file = File(filePath)
         synchronized(this@PluginDropDownReceiver) {
-            if (cloudRFLayer != null) { 
+            if (cloudRFLayer != null) {
                 mapView.removeLayer(MapView.RenderStack.MAP_SURFACE_OVERLAYS, cloudRFLayer)
                 cloudRFLayer = null
                 GLLayerFactory.unregister(GLCloudRFLayer.SPI)
@@ -1794,7 +2103,7 @@ class PluginDropDownReceiver(
         mapGroup.visible = cbLinkLines.isChecked
         refreshView()
     }
-    
+
     private fun handleLayerVisibility() {
         if (mapOverlay.hideAllLayer(pluginContext.getString(R.string.soothsayer_layer), cbCoverageLayer.isChecked)) {
            refreshView()
@@ -1847,19 +2156,19 @@ class PluginDropDownReceiver(
         try {
             val coOptRecyclerView = coOptView.findViewById<RecyclerView>(R.id.co_opt_recycler_view)
             val adapter = coOptRecyclerView.adapter as? CoOptAdapter
-            
+
             if (adapter != null) {
                 // Find the position of the marker in the current displayed list
                 val currentMarkers = adapter.getCurrentMarkers()
                 val position = currentMarkers.indexOfFirst { it.uid == markerUid }
-                
+
                 if (position >= 0) {
                     // Use LinearLayoutManager to scroll to position at top
                     val layoutManager = coOptRecyclerView.layoutManager as? LinearLayoutManager
                     layoutManager?.scrollToPositionWithOffset(position, 0)
-                    
+
                     Log.d(TAG, "Scrolled to marker at position $position in co-opt list")
-                    
+
                     // Flash the item after a short delay to ensure it's visible
                     coOptRecyclerView.postDelayed({
                         adapter.flashItem(markerUid)
@@ -1926,7 +2235,7 @@ class PluginDropDownReceiver(
                 calculate(item)
             }
         }
-        
+
         val currentDate = Date()
         val dateFormat = SimpleDateFormat("yyyy-MM-dd")
         val editDate = spotBeamView.findViewById<EditText>(R.id.editDate)
@@ -2070,7 +2379,7 @@ class PluginDropDownReceiver(
 
         val allCotMarkers = collectAllMarkers(mapView.rootGroup)
         Log.d(TAG, "Added ${allCotMarkers.size} CoT markers from map.")
-        
+
         // Debug: Log available timestamps for first few markers
         allCotMarkers.take(3).forEach { marker ->
             val cotTime = marker.getMetaLong("time", -1L)
@@ -2088,14 +2397,14 @@ class PluginDropDownReceiver(
                 ?: it.getMetaString("name", null)?.takeIf { it.isNotBlank() }
                 ?: it.uid
         }
-        
+
         val sortedCotMarkers = allCotMarkers.sortedByDescending { marker ->
             // Try multiple time sources to get the most accurate creation/update time
             val cotTime = marker.getMetaLong("time", -1L)
-            val startTime = marker.getMetaLong("start", -1L) 
+            val startTime = marker.getMetaLong("start", -1L)
             val addedTime = marker.getMetaLong("addedTime", -1L)
             val lastUpdateTime = marker.getMetaLong("lastUpdateTime", -1L)
-            
+
             // Use the most recent non-negative timestamp, or current time as fallback
             listOf(cotTime, startTime, addedTime, lastUpdateTime, System.currentTimeMillis())
                 .filter { it > 0 }
@@ -2106,18 +2415,18 @@ class PluginDropDownReceiver(
         val allMarkers = mutableListOf<MapItem>()
         allMarkers.addAll(sortedContactMarkers)
         allMarkers.addAll(sortedCotMarkers)
-        
+
         Log.d(TAG, "Final list: ${sortedContactMarkers.size} contacts + ${sortedCotMarkers.size} CoT markers = ${allMarkers.size} total")
         return allMarkers
     }
-    
+
     private fun populateCoOptList() {
         val coOptRecyclerView = coOptView.findViewById<RecyclerView>(R.id.co_opt_recycler_view)
         coOptRecyclerView.layoutManager = LinearLayoutManager(pluginContext)
 
         // Get all available markers (this will be our master list)
         val allAvailableMarkers = getAllAvailableMarkers()
-        
+
         // Create adapter with initial full list
         val coOptAdapter = CoOptAdapter(pluginContext, allAvailableMarkers, templateItems, sharedPrefs) {
             createTemplateSpinnerAdapter()
@@ -2190,7 +2499,7 @@ class PluginDropDownReceiver(
                     coOptedMarkers.remove(uid)
                 }
             }
-            
+
             markerAdapter?.notifyDataSetChanged()
 
             if (coOptedMarkers.isNotEmpty()) {
@@ -2211,14 +2520,14 @@ class PluginDropDownReceiver(
             // Get the checkbox state for this marker
             val config = adapter.coOptConfigurations[mapItem.uid]
             val isChecked = config?.isEnabled ?: false
-            
+
             // Return 0 for checked (top), 1 for unchecked (bottom)
             if (isChecked) 0 else 1
         }.thenBy { mapItem ->
             // Secondary sort: maintain original order within each group
             currentMarkers.indexOf(mapItem)
         })
-        
+
         adapter.updateMarkers(sortedMarkers)
     }
 
@@ -2354,7 +2663,7 @@ class PluginDropDownReceiver(
             }
 
         }
-        
+
         if (lastUpdatedMarker != null) {
             calculate(lastUpdatedMarker)
         }
@@ -2376,7 +2685,7 @@ class PluginDropDownReceiver(
             } else {
                 val distanceMoved = lastLocation.distanceTo(currentMarker.point)
 
-                
+
                 if (distanceMoved >= refreshDistance) {
                     Log.d(TAG, "Marker $uid moved ${distanceMoved}m (threshold: ${refreshDistance}m)")
                     val markerInList = markersList.find { it.coopted_uid == uid }

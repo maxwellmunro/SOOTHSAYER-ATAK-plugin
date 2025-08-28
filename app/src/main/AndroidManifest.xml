@@ -28,6 +28,19 @@
            </intent-filter>
        </activity>
 
+        <activity android:name="com.atakmap.android.soothsayer.FilePickerActivity"
+            android:exported="true"
+            android:process=":atak"/>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.soothsayer.fileprovider"
+            android:exported="true"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 

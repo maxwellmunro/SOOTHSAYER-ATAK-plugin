@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="horizontal"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_margin="2dp">
+
+    <Button
+        android:id="@+id/btnLoadTemplate"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:background="@drawable/btn_gray"
+        android:layout_weight="1"
+        android:textColor="#FFF"/>
+
+    <ImageView
+        android:id="@+id/ivTemplateIcon"
+        android:layout_width="30dp"
+        android:layout_height="match_parent"
+        android:background="@drawable/btn_gray"
+        android:layout_marginStart="5dp"/>
+
+    <CheckBox
+        android:id="@+id/cbSelectTemplate"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"/>
+
+</LinearLayout>
