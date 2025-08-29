@@ -21,6 +21,7 @@ import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.webkit.URLUtil
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -129,6 +130,7 @@ import java.io.InputStreamReader
 import java.util.zip.ZipInputStream
 import androidx.core.graphics.scale
 import androidx.core.graphics.createBitmap
+import androidx.recyclerview.widget.GridLayoutManager
 
 
 @RequiresApi(Build.VERSION_CODES.O)
@@ -410,7 +412,7 @@ class PluginDropDownReceiver(
         initRecyclerview()
     }
 
-    @SuppressLint("UseSwitchCompatOrMaterialCode")
+    @SuppressLint("UseSwitchCompatOrMaterialCode", "ImplicitSamInstance")
     private fun initListeners() {
         val btnOpenSettings: ImageView = templateView.findViewById(R.id.ivSettings)
         btnOpenSettings.setOnClickListener {
@@ -859,10 +861,47 @@ class PluginDropDownReceiver(
         }
 
         val templateIconRecyclerView = pickIconMenuView.findViewById<RecyclerView>(R.id.rvNewTemplateIcons)
-        val templateIconAdapter = TemplateIconsRecyclerViewAdapter(mutableListOf(bitmapFromDrawable(R.drawable.link_icon)),
+        val templateIconAdapter = TemplateIconsRecyclerViewAdapter(mutableListOf(
+            bitmapFromDrawable(R.drawable.automobile),
+            bitmapFromDrawable(R.drawable.balloon),
+            bitmapFromDrawable(R.drawable.bat),
+            bitmapFromDrawable(R.drawable.bolt),
+            bitmapFromDrawable(R.drawable.broadcast_tower),
+            bitmapFromDrawable(R.drawable.drone_alt),
+            bitmapFromDrawable(R.drawable.game_console_handheld),
+            bitmapFromDrawable(R.drawable.helicopter),
+            bitmapFromDrawable(R.drawable.horse),
+            bitmapFromDrawable(R.drawable.male),
+            bitmapFromDrawable(R.drawable.mobile_retro),
+            bitmapFromDrawable(R.drawable.plane),
+            bitmapFromDrawable(R.drawable.radio),
+            bitmapFromDrawable(R.drawable.robot_astromech),
+            bitmapFromDrawable(R.drawable.signal_stream),
+            bitmapFromDrawable(R.drawable.tower_cell),
+            bitmapFromDrawable(R.drawable.walkie_talkie),
+            bitmapFromDrawable(R.drawable.wifi)),
             newTemplateMenuView.findViewById(R.id.ivNewTemplateIcon), pickIconMenuView, newTemplateMenuView)
+
         templateIconRecyclerView.adapter = templateIconAdapter
-        templateIconRecyclerView.layoutManager = LinearLayoutManager(templateIconRecyclerView.context)
+
+        templateIconRecyclerView.viewTreeObserver.addOnGlobalLayoutListener(object :
+            ViewTreeObserver.OnGlobalLayoutListener {
+            override fun onGlobalLayout() {
+                val rvWidth = templateIconRecyclerView.width
+                if (rvWidth > 0) {
+                    val density = templateIconRecyclerView.resources.displayMetrics.density
+                    val itemWidthPx = (50 * density).toInt()
+
+                    val spanCount = 1.coerceAtLeast(rvWidth / itemWidthPx)
+                    templateIconRecyclerView.layoutManager = GridLayoutManager(
+                        templateIconRecyclerView.context,
+                        spanCount
+                    )
+
+                    templateIconRecyclerView.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                }
+            }
+        })
 
         templateIconRecyclerView.setOnClickListener {
             newTemplateMenuView.visibility = View.VISIBLE
